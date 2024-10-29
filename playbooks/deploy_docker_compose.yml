@@ -1,0 +1,167 @@
+---
+- name: Deploy Docker Compose Setup on CentOS
+  hosts: centos_server
+  become: true
+  vars_files:
+    - vault.yml   # Load encrypted credentials from Vault file
+
+  vars:
+    # Define paths, versions, and other settings
+    docker_repo_url: "https://download.docker.com/linux/centos/docker-ce.repo"
+    docker_compose_version: "1.29.2"
+    docker_compose_src_file: "/home/ubuntu/pentera-task/3/docker-compose.yml"
+    docker_compose_url: "https://raw.githubusercontent.com/barfeldman/docker-ansible-task/main/docker-compose.yml"
+    docker_compose_dir: "/home/centos/docker_setup"
+    docker_compose_dest_file: "{{ docker_compose_dir }}/docker-compose.yml"
+    nmap_log: "/var/log/nmap-hercules.log"
+    hercules_url: "http://localhost:8080"
+
+  tasks:
+
+    - name: Ensure required packages for Docker installation are present
+      command: yum install -y yum-utils device-mapper-persistent-data lvm2
+      tags: docker_setup
+      register: docker_prereqs
+      failed_when: docker_prereqs.rc != 0
+      ignore_errors: no
+      # Note: Installs prerequisites directly with yum to avoid module issues on CentOS
+
+    - name: Add Docker repository for CentOS
+      get_url:
+        url: "{{ docker_repo_url }}"
+        dest: /etc/yum.repos.d/docker-ce.repo
+      tags: docker_setup
+      when: docker_prereqs is succeeded
+      # Adds Docker repository file for CentOS only if prerequisites installed correctly
+
+    - name: Install Docker on CentOS 7 using yum command
+      command: yum install -y docker-ce
+      when: ansible_distribution_major_version == "7"
+      tags: docker_setup
+      register: docker_install_command
+      failed_when: docker_install_command.rc != 0
+      ignore_errors: no
+      # Installs Docker directly for CentOS 7, skips if not running on CentOS 7
+
+    - name: Ensure Docker service is running and enabled at startup
+      systemd:
+        name: docker
+        enabled: true
+        state: started
+      tags: docker_setup
+      # Ensures Docker service is active and will restart on boot
+
+    - name: Install Docker Compose binary
+      get_url:
+        url: "https://github.com/docker/compose/releases/download/{{ docker_compose_version }}/docker-compose-Linux-x86_64"
+        dest: /usr/local/bin/docker-compose
+        mode: '0755'
+      tags: docker_setup
+      # Downloads Docker Compose binary, making it executable in the specified path
+
+    - name: Verify Docker and Docker Compose are correctly installed
+      shell: |
+        docker --version && docker compose --version
+      register: verify_docker_compose
+      failed_when: verify_docker_compose.rc != 0
+      tags: docker_setup
+      # Check installed versions of Docker and Docker Compose
+
+    - name: Ensure Docker Compose directory exists
+      file:
+        path: "{{ docker_compose_dir }}"
+        state: directory
+        owner: centos
+        group: centos
+      tags: setup
+      # Creates Docker Compose working directory if it doesn't exist
+
+    - name: Download Docker Compose configuration from GitHub
+      get_url:
+        url: "{{ docker_compose_url }}"
+        dest: "{{ docker_compose_dest_file }}"
+        owner: centos
+        group: centos
+        mode: '0644'
+      tags: setup
+      # Explanation: Downloads the docker-compose.yml from GitHub to the CentOS server
+
+    - name: Docker login to Docker Hub
+      shell: echo "{{ dockerhub_password }}" | docker login -u "{{ dockerhub_username }}" --password-stdin
+      tags: docker_setup
+      register: docker_login
+      failed_when: docker_login.rc != 0
+      # Authenticates with Docker Hub to access private images specified in docker-compose.yml
+
+    - name: Run Docker Compose to start services
+      command: sudo docker compose up -d --pull always
+      args:
+        chdir: "{{ docker_compose_dir }}"
+      tags: run_services
+      register: compose_start
+      failed_when: compose_start.rc != 0
+      # Runs `docker compose up` in detached mode, pulls latest images each time
+
+    - name: Check if Hercules web page is accessible
+      uri:
+        url: "{{ hercules_url }}"
+        return_content: yes
+        status_code: 200
+      register: hercules_status
+      retries: 5
+      delay: 10
+      until: hercules_status.status == 200
+      tags: verify
+      # Checks if the Hercules service is available at the expected URL, retries if needed
+
+    - name: Display Hercules web page content
+      debug:
+        msg: "Hercules Web Page: {{ hercules_status.content }}"
+      tags: verify
+      # Prints the HTML content of the Hercules home page for verification
+
+    - name: Run nmap scan from Neptune to Hercules and save results
+      command: docker exec neptune nmap -oN "{{ nmap_log }}" hercules
+      register: nmap_output
+      changed_when: False
+      tags: diagnostics
+      # Executes nmap from Neptune container, scans Hercules, saves output to log
+
+    - name: Verify nmap scan log file exists
+      stat:
+        path: "{{ nmap_log }}"
+      register: nmap_log_check
+      tags: diagnostics
+      # Verifies nmap log was created, required for subsequent display task
+
+    - name: Adjust permissions on the nmap log file
+      command: docker exec neptune chmod 644 /var/log/nmap-hercules.log
+      tags: diagnostics
+      # Sets readable permissions on the nmap log file within the container that log can be printed to output
+
+    - name: Display nmap scan log content from Neptune container
+      command: docker exec neptune cat /var/log/nmap-hercules.log
+      register: nmap_log_content
+      changed_when: false
+      tags: diagnostics
+      # Outputs nmap scan results for review in the playbook output
+
+    - name: Output nmap scan log content
+      debug:
+        msg: "{{ nmap_log_content.stdout }}"
+      tags: diagnostics
+      # Displays nmap log content stored in stdout 
+
+    - name: Retrieve health check logs from Neptune container
+      command: docker exec neptune tail -n 10 /var/log/hercules_health.log
+      register: health_check_log
+      changed_when: False
+      tags: diagnostics
+      # Fetches the last 10 lines from the Hercules health check log within Neptune because its real-time live data written to log file
+
+    - name: Display health check log output
+      debug:
+        msg: "{{ health_check_log.stdout }}"
+      tags: diagnostics
+      # Outputs health check logs
+
